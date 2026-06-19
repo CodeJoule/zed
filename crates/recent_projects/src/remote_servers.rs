@@ -707,6 +707,11 @@ struct DefaultState {
     /// (server/project indices plus highlight positions) sorted by score.
     filtered_servers: Option<Vec<FilteredServer>>,
     filter_data: Arc<FilterData>,
+    /// Index of the keyboard-selected row into the flat list of currently
+    /// visible selectable entries (see [`RemoteServerProjects::selectable_entries`]).
+    /// The filter editor keeps focus, so selection is tracked by index rather
+    /// than by which element holds focus.
+    selected_index: usize,
 }
 
 impl DefaultState {
@@ -795,6 +800,7 @@ impl DefaultState {
             servers,
             filtered_servers: None,
             filter_data,
+            selected_index: 0,
         }
     }
 
@@ -864,6 +870,77 @@ struct VisibleEntry<'a> {
     server: &'a RemoteEntry,
     host_positions: &'a [usize],
     visible_projects: Vec<VisibleProject<'a>>,
+}
+
+/// A keyboard-selectable row in the default view, in top-to-bottom visual
+/// order. Selection is index-based (the filter editor keeps focus), so the
+/// same ordering is reconstructed for navigation, confirmation and rendering.
+#[derive(Clone)]
+struct SelectableEntry {
+    navigation: NavigableEntry,
+    is_project: bool,
+}
+
+/// Builds the flat, ordered list of selectable rows that matches what
+/// [`RemoteServerProjects::render_default`] paints. `state` must be the same
+/// `DefaultState` that is rendered, and the `*_button` flags must mirror the
+/// conditions under which the corresponding header buttons are shown.
+fn selectable_entries(
+    state: &DefaultState,
+    show_ssh_button: bool,
+    show_devcontainer_button: bool,
+    show_wsl_button: bool,
+) -> Vec<SelectableEntry> {
+    let mut entries = Vec::new();
+    if show_ssh_button {
+        entries.push(SelectableEntry {
+            navigation: state.add_new_server.clone(),
+            is_project: false,
+        });
+    }
+    if show_devcontainer_button {
+        entries.push(SelectableEntry {
+            navigation: state.add_new_devcontainer.clone(),
+            is_project: false,
+        });
+    }
+    if show_wsl_button {
+        entries.push(SelectableEntry {
+            navigation: state.add_new_wsl.clone(),
+            is_project: false,
+        });
+    }
+    for visible in state.visible_servers() {
+        for project in &visible.visible_projects {
+            entries.push(SelectableEntry {
+                navigation: project.entry.navigation.clone(),
+                is_project: true,
+            });
+        }
+        match visible.server {
+            RemoteEntry::Project {
+                open_folder,
+                configure,
+                ..
+            } => {
+                entries.push(SelectableEntry {
+                    navigation: open_folder.clone(),
+                    is_project: false,
+                });
+                entries.push(SelectableEntry {
+                    navigation: configure.clone(),
+                    is_project: false,
+                });
+            }
+            RemoteEntry::SshConfig { open_folder, .. } => {
+                entries.push(SelectableEntry {
+                    navigation: open_folder.clone(),
+                    is_project: false,
+                });
+            }
+        }
+    }
+    entries
 }
 
 struct VisibleProject<'a> {
@@ -1399,9 +1476,148 @@ impl RemoteServerProjects {
         })
     }
 
+    fn workspace_flags(&self, cx: &App) -> (bool, bool) {
+        let has_open_project = self
+            .workspace
+            .upgrade()
+            .map(|workspace| {
+                workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .is_some()
+            })
+            .unwrap_or(false);
+        // We cannot currently connect a dev container from within a remote
+        // server due to the remote_server architecture.
+        let is_local = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).project().read(cx).is_local())
+            .unwrap_or(true);
+        (has_open_project, is_local)
+    }
+
+    fn current_selectable_entries(&self, cx: &App) -> Vec<SelectableEntry> {
+        let Mode::Default(state) = &self.mode else {
+            return Vec::new();
+        };
+        let query_empty = self.filter_editor.read(cx).text(cx).trim().is_empty();
+        let (has_open_project, is_local) = self.workspace_flags(cx);
+        selectable_entries(
+            state,
+            query_empty,
+            query_empty && has_open_project && is_local,
+            cfg!(target_os = "windows"),
+        )
+    }
+
+    fn move_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = self.current_selectable_entries(cx);
+        if entries.is_empty() {
+            return;
+        }
+        let len = entries.len();
+        let Mode::Default(state) = &mut self.mode else {
+            return;
+        };
+        let current = state.selected_index.min(len - 1);
+        let next = (current as isize + delta).rem_euclid(len as isize) as usize;
+        state.selected_index = next;
+        if let Some(anchor) = &entries[next].navigation.scroll_anchor {
+            anchor.scroll_to(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn set_selection(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = self.current_selectable_entries(cx);
+        if entries.is_empty() {
+            return;
+        }
+        let index = index.min(entries.len() - 1);
+        let Mode::Default(state) = &mut self.mode else {
+            return;
+        };
+        state.selected_index = index;
+        if let Some(anchor) = &entries[index].navigation.scroll_anchor {
+            anchor.scroll_to(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.mode, Mode::Default(_)) {
+            self.move_selection(1, window, cx);
+        }
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.mode, Mode::Default(_)) {
+            self.move_selection(-1, window, cx);
+        }
+    }
+
+    fn select_first(&mut self, _: &menu::SelectFirst, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.mode, Mode::Default(_)) {
+            self.set_selection(0, window, cx);
+        }
+    }
+
+    fn select_last(&mut self, _: &menu::SelectLast, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.mode, Mode::Default(_)) {
+            self.set_selection(usize::MAX, window, cx);
+        }
+    }
+
+    /// Forwards `Confirm`/`SecondaryConfirm` to the keyboard-selected row.
+    /// The filter editor keeps focus, so the row's own `on_action` handler is
+    /// not on the dispatch path; instead we re-dispatch the action to the
+    /// row's focus handle. This is deferred so it runs after the current
+    /// update completes, avoiding a re-entrant entity update.
+    fn confirm_selection(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = self.current_selectable_entries(cx);
+        if entries.is_empty() {
+            return;
+        }
+        let Mode::Default(state) = &self.mode else {
+            return;
+        };
+        let index = state.selected_index.min(entries.len() - 1);
+        let handle = entries[index].navigation.focus_handle.clone();
+        window.defer(cx, move |window, cx| {
+            if secondary {
+                handle.dispatch_action(&menu::SecondaryConfirm, window, cx);
+            } else {
+                handle.dispatch_action(&menu::Confirm, window, cx);
+            }
+        });
+    }
+
+    fn secondary_confirm(
+        &mut self,
+        _: &menu::SecondaryConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.mode, Mode::Default(_)) {
+            self.confirm_selection(true, window, cx);
+        }
+    }
+
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         match &self.mode {
-            Mode::Default(_) | Mode::ViewServerOptions(_) => {}
+            Mode::Default(_) => {
+                self.confirm_selection(false, window, cx);
+            }
+            Mode::ViewServerOptions(_) => {}
             Mode::ProjectPicker(_) => {}
             Mode::CreateRemoteServer(state) => {
                 if let Some(prompt) = state.ssh_prompt.as_ref() {
@@ -1480,6 +1696,9 @@ impl RemoteServerProjects {
         let query = self.filter_editor.read(cx).text(cx);
         let query = query.trim().to_string();
 
+        // Reset the selection so the top match is selected as the user types.
+        state.selected_index = 0;
+
         // Signal cancellation to the previously-spawned task: it still holds
         // its own `Arc` clone of the old `filter_cancel`, so this store is
         // visible to it. We then install a fresh `AtomicBool` below for the
@@ -1518,7 +1737,7 @@ impl RemoteServerProjects {
         ix: usize,
         visible: &VisibleEntry<'_>,
         show_top_separator: bool,
-        window: &mut Window,
+        selected: Option<&FocusHandle>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let remote_server = visible.server;
@@ -1596,7 +1815,7 @@ impl RemoteServerProjects {
                                 shared_connection.clone(),
                                 pix,
                                 p,
-                                window,
+                                selected,
                                 cx,
                             ))
                         }))
@@ -1618,9 +1837,7 @@ impl RemoteServerProjects {
                                 }))
                                 .child(
                                     ListItem::new(("new-remote-project", ix))
-                                        .toggle_state(
-                                            open_folder.focus_handle.contains_focused(window, cx),
-                                        )
+                                        .toggle_state(selected == Some(&open_folder.focus_handle))
                                         .inset(true)
                                         .spacing(ui::ListItemSpacing::Sparse)
                                         .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
@@ -1656,9 +1873,7 @@ impl RemoteServerProjects {
                                 }))
                                 .child(
                                     ListItem::new(("server-options", ix))
-                                        .toggle_state(
-                                            configure.focus_handle.contains_focused(window, cx),
-                                        )
+                                        .toggle_state(selected == Some(&configure.focus_handle))
                                         .inset(true)
                                         .spacing(ui::ListItemSpacing::Sparse)
                                         .start_slot(
@@ -1700,7 +1915,7 @@ impl RemoteServerProjects {
                         }))
                         .child(
                             ListItem::new(("new-remote-project", ix))
-                                .toggle_state(open_folder.focus_handle.contains_focused(window, cx))
+                                .toggle_state(selected == Some(&open_folder.focus_handle))
                                 .inset(true)
                                 .spacing(ui::ListItemSpacing::Sparse)
                                 .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
@@ -1729,7 +1944,7 @@ impl RemoteServerProjects {
         connection: Rc<Connection>,
         ix: usize,
         visible: &VisibleProject<'_>,
-        window: &mut Window,
+        selected: Option<&FocusHandle>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let entry = visible.entry;
@@ -1815,7 +2030,7 @@ impl RemoteServerProjects {
             }))
             .child(
                 ListItem::new((element_id_base, ix))
-                    .toggle_state(entry.navigation.focus_handle.contains_focused(window, cx))
+                    .toggle_state(selected == Some(&entry.navigation.focus_handle))
                     .inset(true)
                     .spacing(ui::ListItemSpacing::Sparse)
                     .start_slot(
@@ -2837,6 +3052,21 @@ impl RemoteServerProjects {
             }
         }
 
+        let (has_open_project, is_local) = self.workspace_flags(cx);
+        let selectable = selectable_entries(
+            &state,
+            query.is_empty(),
+            query.is_empty() && has_open_project && is_local,
+            cfg!(target_os = "windows"),
+        );
+        let selected_index = state.selected_index.min(selectable.len().saturating_sub(1));
+        let selected_handle = selectable
+            .get(selected_index)
+            .map(|entry| entry.navigation.focus_handle.clone());
+        let is_project_selected = selectable
+            .get(selected_index)
+            .is_some_and(|entry| entry.is_project);
+
         let visible_servers = state.visible_servers();
 
         let connect_button = div()
@@ -2846,10 +3076,7 @@ impl RemoteServerProjects {
             .child(
                 ListItem::new("register-remote-server-button")
                     .toggle_state(
-                        state
-                            .add_new_server
-                            .focus_handle
-                            .contains_focused(window, cx),
+                        selected_handle.as_ref() == Some(&state.add_new_server.focus_handle),
                     )
                     .inset(true)
                     .spacing(ui::ListItemSpacing::Sparse)
@@ -2876,10 +3103,7 @@ impl RemoteServerProjects {
             .child(
                 ListItem::new("register-dev-container-button")
                     .toggle_state(
-                        state
-                            .add_new_devcontainer
-                            .focus_handle
-                            .contains_focused(window, cx),
+                        selected_handle.as_ref() == Some(&state.add_new_devcontainer.focus_handle),
                     )
                     .inset(true)
                     .spacing(ui::ListItemSpacing::Sparse)
@@ -2900,7 +3124,7 @@ impl RemoteServerProjects {
             .anchor_scroll(state.add_new_wsl.scroll_anchor.clone())
             .child(
                 ListItem::new("wsl-add-new-server")
-                    .toggle_state(state.add_new_wsl.focus_handle.contains_focused(window, cx))
+                    .toggle_state(selected_handle.as_ref() == Some(&state.add_new_wsl.focus_handle))
                     .inset(true)
                     .spacing(ui::ListItemSpacing::Sparse)
                     .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
@@ -2918,27 +3142,6 @@ impl RemoteServerProjects {
 
                 cx.notify();
             }));
-
-        let has_open_project = self
-            .workspace
-            .upgrade()
-            .map(|workspace| {
-                workspace
-                    .read(cx)
-                    .project()
-                    .read(cx)
-                    .visible_worktrees(cx)
-                    .next()
-                    .is_some()
-            })
-            .unwrap_or(false);
-
-        // We cannot currently connect a dev container from within a remote server due to the remote_server architecture
-        let is_local = self
-            .workspace
-            .upgrade()
-            .map(|workspace| workspace.read(cx).project().read(cx).is_local())
-            .unwrap_or(true);
 
         let modal_section = v_flex()
             .track_focus(&self.focus_handle)
@@ -2958,81 +3161,39 @@ impl RemoteServerProjects {
         #[cfg(not(target_os = "windows"))]
         let modal_section = modal_section;
 
-        let mut modal_section = Navigable::new(
-            modal_section
-                .child(
-                    List::new()
-                        .empty_message(
-                            h_flex()
-                                .size_full()
-                                .p_2()
-                                .justify_center()
-                                .border_t_1()
-                                .border_color(cx.theme().colors().border_variant)
-                                .child(
-                                    Label::new(if query.is_empty() {
-                                        "No remote servers registered yet."
-                                    } else {
-                                        "No matching remote projects."
-                                    })
-                                    .color(Color::Muted),
-                                )
-                                .into_any_element(),
-                        )
-                        .children(visible_servers.iter().enumerate().map(|(ix, visible)| {
-                            let show_top_separator = ix > 0 || query.is_empty();
-                            self.render_remote_connection(
-                                ix,
-                                visible,
-                                show_top_separator,
-                                window,
-                                cx,
+        let mut modal_section = modal_section
+            .child(
+                List::new()
+                    .empty_message(
+                        h_flex()
+                            .size_full()
+                            .p_2()
+                            .justify_center()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Label::new(if query.is_empty() {
+                                    "No remote servers registered yet."
+                                } else {
+                                    "No matching remote projects."
+                                })
+                                .color(Color::Muted),
                             )
-                            .into_any_element()
-                        })),
-                )
-                .into_any_element(),
-        )
-        .entry(state.add_new_server.clone());
-
-        if has_open_project && is_local {
-            modal_section = modal_section.entry(state.add_new_devcontainer.clone());
-        }
-
-        if cfg!(target_os = "windows") {
-            modal_section = modal_section.entry(state.add_new_wsl.clone());
-        }
-
-        for visible in &visible_servers {
-            for project in &visible.visible_projects {
-                modal_section = modal_section.entry(project.entry.navigation.clone());
-            }
-            match visible.server {
-                RemoteEntry::Project {
-                    open_folder,
-                    configure,
-                    ..
-                } => {
-                    modal_section = modal_section
-                        .entry(open_folder.clone())
-                        .entry(configure.clone());
-                }
-                RemoteEntry::SshConfig { open_folder, .. } => {
-                    modal_section = modal_section.entry(open_folder.clone());
-                }
-            }
-        }
-        let mut modal_section = modal_section.render(window, cx).into_any_element();
-
-        let is_project_selected = visible_servers.iter().any(|visible| {
-            visible.visible_projects.iter().any(|project| {
-                project
-                    .entry
-                    .navigation
-                    .focus_handle
-                    .contains_focused(window, cx)
-            })
-        });
+                            .into_any_element(),
+                    )
+                    .children(visible_servers.iter().enumerate().map(|(ix, visible)| {
+                        let show_top_separator = ix > 0 || query.is_empty();
+                        self.render_remote_connection(
+                            ix,
+                            visible,
+                            show_top_separator,
+                            selected_handle.as_ref(),
+                            cx,
+                        )
+                        .into_any_element()
+                    })),
+            )
+            .into_any_element();
 
         let filter_editor = self.filter_editor.clone();
 
@@ -3044,7 +3205,13 @@ impl RemoteServerProjects {
                         .min_h(rems(20.))
                         .size_full()
                         .relative()
-                        .child(div().px_2().py_1().child(filter_editor))
+                        .child(
+                            div()
+                                .key_context("RemoteProjectFilter")
+                                .px_2()
+                                .py_1()
+                                .child(filter_editor),
+                        )
                         .child(ListSeparator)
                         .child(
                             canvas(
@@ -3228,6 +3395,11 @@ impl Render for RemoteServerProjects {
             .key_context("RemoteServerModal")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::secondary_confirm))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
             .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
                 this.focus_handle(cx).focus(window, cx);
             }))
@@ -3288,6 +3460,7 @@ mod filter_tests {
                 filter_data: Arc::new(FilterData::build(&entries)),
                 servers: entries,
                 filtered_servers: None,
+                selected_index: 0,
             };
 
             state.filter_sync("alp");

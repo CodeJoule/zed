@@ -1172,6 +1172,15 @@
     },
   },
   {
+    "context": "RemoteProjectFilter > Editor",
+    "bindings": {
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "tab": "menu::SelectNext",
+      "shift-tab": "menu::SelectPrevious",
+    },
+  },
+  {
     "context": "ToolchainSelector",
     "use_key_equivalents": true,
     "bindings": {
